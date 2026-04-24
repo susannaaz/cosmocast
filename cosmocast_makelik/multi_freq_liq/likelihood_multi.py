@@ -93,10 +93,16 @@ def make_nz_dict_from_array(nz_array,freq_dict,experiment):
     '''
     nz_dict = {}
     for i,name in enumerate(freq_dict[experiment]):
-        if len(name) ==2:
-            nz_dict['f0{}'.format(name)] = nz_array[i]
-        else:
-            nz_dict['f{}'.format(name)] = nz_array[i]
+        # `frequencies[...]` are often zero-padded (e.g. "027"), while some
+        # pair keys use the non-padded form (e.g. "SAT_27xSAT_27"). To stay
+        # compatible with both conventions, store both spellings.
+        key_padded = 'f{}'.format(name) if len(name) != 2 else 'f0{}'.format(name)
+        nz_dict[key_padded] = nz_array[i]
+        try:
+            key_unpadded = 'f{}'.format(int(name))
+            nz_dict.setdefault(key_unpadded, nz_array[i])
+        except Exception:
+            pass
     return nz_dict
 
 

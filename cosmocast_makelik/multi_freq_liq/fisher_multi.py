@@ -39,6 +39,7 @@ class FisherResult:
     dC:         list
     bands:      list
     param_list: list[str]
+    metadata:   dict = field(default_factory=dict)
 
 
     def with_prior(self, priors: dict[str, float]) -> "FisherResult":
@@ -54,6 +55,7 @@ class FisherResult:
             F=F_prior, Cov_params=Cov_prior,
             sigma=np.sqrt(np.diag(Cov_prior)),
             dC=self.dC, bands=self.bands, param_list=self.param_list,
+            metadata=self.metadata,
         )
 
     def combine(self, other: "FisherResult") -> "FisherResult":
@@ -61,12 +63,18 @@ class FisherResult:
             raise ValueError("param_lists must match to combine.")
         F_combined = self.F + other.F
         Cov_combined = np.linalg.pinv(F_combined)
+        metadata = {}
+        if isinstance(self.metadata, dict):
+            metadata.update(self.metadata)
+        if isinstance(other.metadata, dict):
+            metadata.update(other.metadata)
         return FisherResult(
             F=F_combined, Cov_params=Cov_combined,
             sigma=np.sqrt(np.diag(Cov_combined)),
             dC=self.dC + other.dC,
             bands=self.bands + other.bands,
             param_list=self.param_list,
+            metadata=metadata,
         )
 
     def _centers(self, scaled_params: set = frozenset()) -> np.ndarray:

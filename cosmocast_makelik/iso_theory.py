@@ -1,5 +1,8 @@
 import numpy as np
-from classy import Class
+try:
+    from classy import Class
+except ModuleNotFoundError:  # optional dependency (CLASS)
+    Class = None
 
 def make_isocur_params(
     lmax=10_000,
@@ -115,6 +118,11 @@ def compute_cls(
     P_RI_2 = 1.0e-13,
 
 ):
+    if Class is None:
+        raise ModuleNotFoundError(
+            "Missing optional dependency `classy` (CLASS). "
+            "Install CLASS/classy to enable compute_cls()."
+        )
     params = make_isocur_params(
         lmax=lmax,
         lensing=lensing,
