@@ -1472,6 +1472,14 @@ def compare_and_save_constraints(
                 f"Unknown combination_mode={combination_mode!r} (expected 'fisher_sum', 'joint_cov', or 'ell_by_ell')."
             )
 
+        # Ensure Planck lowE/tau-prior handling is applied to the *final* Fisher,
+        # including joint_cov and ell_by_ell outputs built from bands.
+        unified = apply_planck_lowE_tau_prior(
+            unified,
+            planck_likelihood_mode=planck_likelihood_mode,
+            tau_prior_sigma=planck_tau_prior_sigma,
+        )
+
         out_dir = out_base / out_year_tag
         if include_corr_subdir and include_corr:
             out_dir = out_dir / corr
@@ -1606,6 +1614,12 @@ def compare_and_save_constraints(
             else:
                 raise ValueError(f"Unknown combination_mode={combination_mode!r}")
 
+            pk_so = apply_planck_lowE_tau_prior(
+                pk_so,
+                planck_likelihood_mode=planck_likelihood_mode,
+                tau_prior_sigma=planck_tau_prior_sigma,
+            )
+
             overlay_fishers_summed = [
                 (pk, "Planck"),
                 (pk_so, f"Planck + SO {year_tag}"),
@@ -1705,6 +1719,75 @@ def load_planck_pliklite_data(
     return lite_data
 
 
+def add_gaussian_prior_to_fisher(
+    fisher_obj: Any,
+    param_name: str = "tau_reio",
+    sigma: float = 0.007,
+) -> Any:
+    """
+    Add a Gaussian prior to a Fisher object.
+
+    This adds 1/sigma^2 to the diagonal Fisher element for `param_name` and
+    refreshes covariance / marginalized sigmas when possible.
+
+    Returns a (typically new) Fisher object. If `param_name` is not present,
+    returns the input object unchanged.
+    """
+    import numpy as np
+
+    if fisher_obj is None:
+        return fisher_obj
+
+    sigma = float(sigma)
+    if not np.isfinite(sigma) or sigma <= 0:
+        raise ValueError(f"Invalid prior sigma={sigma!r}; expected a finite positive float.")
+
+    param_list = getattr(fisher_obj, "param_list", None)
+    if not param_list:
+        return fisher_obj
+    if param_name not in param_list:
+        return fisher_obj
+
+    # Prefer the object's native API when available.
+    with_prior = getattr(fisher_obj, "with_prior", None)
+    if callable(with_prior):
+        return with_prior({str(param_name): float(sigma)})
+
+    # Fallback for Fisher-like objects.
+    F = getattr(fisher_obj, "F", None)
+    if F is None:
+        return fisher_obj
+    F2 = np.array(F, dtype=float, copy=True)
+    i = list(param_list).index(param_name)
+    F2[i, i] += 1.0 / (sigma**2)
+
+    Cov = np.linalg.pinv(F2)
+    sig = np.sqrt(np.diag(Cov))
+
+    # Try to preserve type if it looks like a `FisherResult`.
+    try:
+        return type(fisher_obj)(
+            F=F2,
+            Cov_params=Cov,
+            sigma=sig,
+            dC=getattr(fisher_obj, "dC", []),
+            bands=getattr(fisher_obj, "bands", []),
+            param_list=list(param_list),
+            metadata=getattr(fisher_obj, "metadata", {}) or {},
+        )
+    except Exception:
+        # Last resort: update in-place if the object is mutable.
+        try:
+            fisher_obj.F = F2
+            if hasattr(fisher_obj, "Cov_params"):
+                fisher_obj.Cov_params = Cov
+            if hasattr(fisher_obj, "sigma"):
+                fisher_obj.sigma = sig
+        except Exception:
+            pass
+        return fisher_obj
+
+
 def apply_planck_lowE_tau_prior(
     fisher,
     *,
@@ -1716,6 +1799,12 @@ def apply_planck_lowE_tau_prior(
 
     This is used when PLANCK_LIKELIHOOD_MODE='TTTEEE_lowE' is requested but no
     true low-ell EE bandpowers/likelihood are available in this repo.
+
+    Notes
+    -----
+    This helper is intentionally idempotent (it will not apply the same tau
+    prior twice) when the Fisher object's metadata indicates the prior has
+    already been added.
     """
     if planck_likelihood_mode == "pliklite_lowT":
         return fisher
@@ -1725,12 +1814,29 @@ def apply_planck_lowE_tau_prior(
         )
     if "tau_reio" not in fisher.param_list:
         return fisher
-    out = fisher.with_prior({"tau_reio": float(tau_prior_sigma)})
-    out.metadata = (getattr(out, "metadata", {}) or {}) | {
+
+    meta = getattr(fisher, "metadata", None)
+    if isinstance(meta, dict):
+        gp = meta.get("gaussian_priors", {}) or {}
+        existing = gp.get("tau_reio", None)
+        if existing is not None and abs(float(existing) - float(tau_prior_sigma)) < 1e-15:
+            return fisher
+        if meta.get("planck_lowE") == "approximated_by_tau_prior" and abs(
+            float(meta.get("planck_tau_prior_sigma", tau_prior_sigma)) - float(tau_prior_sigma)
+        ) < 1e-15:
+            return fisher
+
+    out = add_gaussian_prior_to_fisher(fisher, param_name="tau_reio", sigma=float(tau_prior_sigma))
+    out_meta = dict(getattr(out, "metadata", {}) or {}) if isinstance(getattr(out, "metadata", None), dict) else {}
+    gp = dict(out_meta.get("gaussian_priors", {}) or {})
+    gp["tau_reio"] = float(tau_prior_sigma)
+    out_meta["gaussian_priors"] = gp
+    out_meta |= {
         "planck_likelihood_mode": planck_likelihood_mode,
         "planck_lowE": "approximated_by_tau_prior",
         "planck_tau_prior_sigma": float(tau_prior_sigma),
     }
+    out.metadata = out_meta
     return out
 
 
