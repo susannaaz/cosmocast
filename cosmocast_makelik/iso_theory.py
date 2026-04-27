@@ -26,6 +26,8 @@ def make_isocur_params(
     #always positive
     P_RI_2 = 1.0e-13,
     high_accuracy = False
+    ,
+    power_mode: str = "legacy_binned",
 ):
 
     params = {
@@ -42,6 +44,20 @@ def make_isocur_params(
         'P_{RR}^2': P_RR_2
         # NOTE: intentionally NOT setting 'l_max_lss' to avoid "not read" errors on some builds.
     }
+
+    if power_mode == "standard":
+        # Standard adiabatic primordial spectrum (A_s, n_s).
+        # This is only intended for iso_mode=None; for isocurvature workflows
+        # we keep the legacy two_scales parameterization.
+        params.pop('P_k_ini type', None)
+        params.pop('k1', None)
+        params.pop('k2', None)
+        params.pop('P_{RR}^1', None)
+        params.pop('P_{RR}^2', None)
+        params['A_s'] = A_s
+        params['n_s'] = n_s
+    elif power_mode != "legacy_binned":
+        raise ValueError(f"Unknown power_mode={power_mode!r} (expected 'legacy_binned' or 'standard').")
 
     if iso_mode is not None:
         params['ic'] = f'ad,{iso_mode}'
@@ -117,6 +133,7 @@ def compute_cls(
     #always positive
     P_RI_2 = 1.0e-13,
 
+    power_mode: str = "legacy_binned",
 ):
     if Class is None:
         raise ModuleNotFoundError(
@@ -144,6 +161,7 @@ def compute_cls(
         P_RI_1 = P_RI_1,
         #always positive
         P_RI_2 = P_RI_2,
+        power_mode=power_mode,
     )
         
 
