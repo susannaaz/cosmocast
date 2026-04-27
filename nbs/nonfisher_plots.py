@@ -201,7 +201,7 @@ def compute_and_save_noise_and_cov_plots(
     lat_lmax: int = 3000,
     dell: int = 10,
     skip_existing: bool = True,
-) -> None:
+) -> dict | None:
     """
     Save additional non-Fisher plots:
     - Unified noise curves (TT and EE)
@@ -211,7 +211,7 @@ def compute_and_save_noise_and_cov_plots(
     """
     if not has_classy():
         print("Skipping noise/cov plots: `classy` is not installed.")
-        return
+        return None
 
     import numpy as np
     import matplotlib.pyplot as plt
@@ -405,3 +405,6 @@ def compute_and_save_noise_and_cov_plots(
     cov_te = out_dir / "cov_diag_TE.pdf"
     if not _maybe_skip(cov_te, skip_existing):
         _plot_cov_diag(["LAT_cross", "PK_lite_cross"], "TE", cov_te)
+
+    # Return the unified dict for downstream notebook plots.
+    return so_unif
