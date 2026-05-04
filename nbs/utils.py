@@ -958,6 +958,7 @@ def _noise_dict_from_bands_auto(
     spectrum: str,
     fid_c_ell: dict[str, Any],
     fsky_override: float | None = None,
+    ell_max: int | None = None,
 ) -> tuple[dict[int, float], dict[int, int], dict[int, float]]:
     """
     Build (N_ell, dell_ell, fsky_ell) dictionaries for an auto spectrum from bands,
@@ -979,10 +980,19 @@ def _noise_dict_from_bands_auto(
             ell = int(np.round(float(e)))
             c = float(np.asarray(fid_c_ell[spectrum])[ell])
             n = _infer_noise_auto_from_var(var=float(v), c_ell=c, ell=ell, dell=dell, fsky=fsky)
-            if (ell not in n_by_ell) or (n < n_by_ell[ell]):
-                n_by_ell[ell] = float(n)
-                dell_by_ell[ell] = int(dell)
-                fsky_by_ell[ell] = float(fsky)
+            # Expand the binned point onto an integer-ell grid so different
+            # experiments with different bin centers still overlap when we
+            # select an "effective experiment" ell-by-ell.
+            half = max(0, int(dell) // 2)
+            for l2 in range(int(ell) - half, int(ell) + half + 1):
+                if l2 < 2:
+                    continue
+                if ell_max is not None and int(l2) > int(ell_max):
+                    continue
+                if (l2 not in n_by_ell) or (n < n_by_ell[l2]):
+                    n_by_ell[l2] = float(n)
+                    dell_by_ell[l2] = int(dell)
+                    fsky_by_ell[l2] = float(fsky)
     return n_by_ell, dell_by_ell, fsky_by_ell
 
 
@@ -1005,9 +1015,13 @@ def fisher_from_ell_by_ell_effective_experiment(
     """
     Teo-style effective-experiment combination:
       - infer per-experiment auto-spectrum noise curves from band variances
-      - at each ell and spectrum, select the experiment with minimum noise
-      - build a single effective covariance from (C_ell + N_eff) and per-ell f_sky
+      - choose how to combine experiments at each integer ell (see ell_by_ell_policy)
+      - build a single effective covariance from (C_ell + N_eff) and per-ell f_sky / Δℓ
       - compute one Fisher matrix from the effective bands.
+
+    ell_by_ell_policy:
+      - "min_noise": select a single experiment at each ell (can look piecewise at transitions)
+      - "inv_var": inverse-variance combine experiments at each ell (smoother across overlaps)
 
     Experiment/f_sky conventions (per requirement):
       - Planck:   0.7
@@ -1017,8 +1031,10 @@ def fisher_from_ell_by_ell_effective_experiment(
     """
     import numpy as np
 
-    if ell_by_ell_policy != "min_noise":
-        raise ValueError(f"Unsupported ELL_BY_ELL_POLICY={ell_by_ell_policy!r} (expected 'min_noise').")
+    if str(ell_by_ell_policy) not in {"min_noise", "inv_var"}:
+        raise ValueError(
+            f"Unsupported ELL_BY_ELL_POLICY={ell_by_ell_policy!r} (expected 'min_noise' or 'inv_var')."
+        )
 
     from cosmocast_makelik.multi_freq_liq import fisher_multi
     from cosmocast_makelik.multi_freq_liq.fisher_multi import SpectrumBand
@@ -1060,28 +1076,28 @@ def fisher_from_ell_by_ell_effective_experiment(
 
     # Build noise dictionaries for TT/EE per "effective experiment"
     n_tt_planck, dell_tt_planck, fsky_tt_planck = _noise_dict_from_bands_auto(
-        bands=planck_bands, spectrum="TT", fid_c_ell=cls_cov, fsky_override=0.7
+        bands=planck_bands, spectrum="TT", fid_c_ell=cls_cov, fsky_override=0.7, ell_max=int(ell_max_theory)
     )
     n_ee_planck, dell_ee_planck, fsky_ee_planck = _noise_dict_from_bands_auto(
-        bands=planck_bands, spectrum="EE", fid_c_ell=cls_cov, fsky_override=0.7
+        bands=planck_bands, spectrum="EE", fid_c_ell=cls_cov, fsky_override=0.7, ell_max=int(ell_max_theory)
     )
     n_tt_lb, dell_tt_lb, fsky_tt_lb = _noise_dict_from_bands_auto(
-        bands=litebird_bands, spectrum="TT", fid_c_ell=cls_cov, fsky_override=0.7
+        bands=litebird_bands, spectrum="TT", fid_c_ell=cls_cov, fsky_override=0.7, ell_max=int(ell_max_theory)
     )
     n_ee_lb, dell_ee_lb, fsky_ee_lb = _noise_dict_from_bands_auto(
-        bands=litebird_bands, spectrum="EE", fid_c_ell=cls_cov, fsky_override=0.7
+        bands=litebird_bands, spectrum="EE", fid_c_ell=cls_cov, fsky_override=0.7, ell_max=int(ell_max_theory)
     )
     n_tt_sat, dell_tt_sat, fsky_tt_sat = _noise_dict_from_bands_auto(
-        bands=so_sat, spectrum="TT", fid_c_ell=cls_cov, fsky_override=0.1
+        bands=so_sat, spectrum="TT", fid_c_ell=cls_cov, fsky_override=0.1, ell_max=int(ell_max_theory)
     )
     n_ee_sat, dell_ee_sat, fsky_ee_sat = _noise_dict_from_bands_auto(
-        bands=so_sat, spectrum="EE", fid_c_ell=cls_cov, fsky_override=0.1
+        bands=so_sat, spectrum="EE", fid_c_ell=cls_cov, fsky_override=0.1, ell_max=int(ell_max_theory)
     )
     n_tt_lat, dell_tt_lat, fsky_tt_lat = _noise_dict_from_bands_auto(
-        bands=so_lat_tt, spectrum="TT", fid_c_ell=cls_cov, fsky_override=0.4
+        bands=so_lat_tt, spectrum="TT", fid_c_ell=cls_cov, fsky_override=0.4, ell_max=int(ell_max_theory)
     )
     n_ee_lat, dell_ee_lat, fsky_ee_lat = _noise_dict_from_bands_auto(
-        bands=so_lat_ee, spectrum="EE", fid_c_ell=cls_cov, fsky_override=0.4
+        bands=so_lat_ee, spectrum="EE", fid_c_ell=cls_cov, fsky_override=0.4, ell_max=int(ell_max_theory)
     )
 
     sources = {
@@ -1091,12 +1107,15 @@ def fisher_from_ell_by_ell_effective_experiment(
         "SO LAT": {"TT": (n_tt_lat, dell_tt_lat, fsky_tt_lat), "EE": (n_ee_lat, dell_ee_lat, fsky_ee_lat)},
     }
 
-    # TE availability: only include sources that actually have TE bands.
+    # TE availability:
+    # Even if the input bands do not explicitly include TE, we can still build an
+    # approximate TE covariance from the inferred TT and EE noises, as long as
+    # both T and E are available (this is what `_select_te` uses).
     has_te = {
-        "Planck": any(str(getattr(b, "cell_type", "")) == "TE" for b in planck_bands),
-        "LiteBIRD": any(str(getattr(b, "cell_type", "")) == "TE" for b in litebird_bands),
-        "SO SAT": any(str(getattr(b, "cell_type", "")) == "TE" for b in so_sat),
-        "SO LAT": any(str(getattr(b, "cell_type", "")) == "TE" for b in so_bands),
+        "Planck": bool(n_tt_planck) and bool(n_ee_planck),
+        "LiteBIRD": bool(n_tt_lb) and bool(n_ee_lb),
+        "SO SAT": bool(n_tt_sat) and bool(n_ee_sat),
+        "SO LAT": bool(n_tt_lat) and bool(n_ee_lat),
     }
 
     def _select_auto(spec: str) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
@@ -1110,26 +1129,53 @@ def fisher_from_ell_by_ell_effective_experiment(
         counts = {k: 0 for k in sources.keys()}
         var = np.zeros_like(ell_sorted, dtype=float)
         for i, l in enumerate(ell_sorted):
-            best_src = None
-            best_n = None
-            best_dell = None
-            best_fsky = None
-            for name, src in sources.items():
-                n_map, dell_map, fsky_map = src.get(spec, ({}, {}, {}))
-                if l not in n_map:
-                    continue
-                n = float(n_map[l])
-                if (best_n is None) or (n < best_n):
-                    best_n = n
-                    best_src = name
-                    best_dell = int(dell_map.get(l, 1))
-                    best_fsky = float(fsky_map.get(l, 1.0))
-            if best_src is None:
-                var[i] = np.nan
-                continue
-            counts[best_src] += 1
             c = float(np.asarray(cls_cov[spec])[int(l)])
-            var[i] = 2.0 / ((2.0 * float(l) + 1.0) * float(best_fsky) * float(best_dell)) * (c + float(best_n)) ** 2
+
+            if str(ell_by_ell_policy) == "min_noise":
+                best_src = None
+                best_n = None
+                best_dell = None
+                best_fsky = None
+                for name, src in sources.items():
+                    n_map, dell_map, fsky_map = src.get(spec, ({}, {}, {}))
+                    if l not in n_map:
+                        continue
+                    n = float(n_map[l])
+                    if (best_n is None) or (n < best_n):
+                        best_n = n
+                        best_src = name
+                        best_dell = int(dell_map.get(l, 1))
+                        best_fsky = float(fsky_map.get(l, 1.0))
+                if best_src is None:
+                    var[i] = np.nan
+                    continue
+                counts[best_src] += 1
+                var[i] = (
+                    2.0
+                    / ((2.0 * float(l) + 1.0) * float(best_fsky) * float(best_dell))
+                    * (c + float(best_n)) ** 2
+                )
+            else:
+                # "inv_var": treat experiments as independent measurements of the
+                # same C_ell and inverse-variance combine their bandpower errors.
+                inv_var_sum = 0.0
+                n_contrib = 0
+                for name, src in sources.items():
+                    n_map, dell_map, fsky_map = src.get(spec, ({}, {}, {}))
+                    if l not in n_map:
+                        continue
+                    n = float(n_map[l])
+                    dell = float(dell_map.get(l, 1))
+                    fsky = float(fsky_map.get(l, 1.0))
+                    v = 2.0 / ((2.0 * float(l) + 1.0) * fsky * dell) * (c + n) ** 2
+                    if np.isfinite(v) and v > 0:
+                        inv_var_sum += 1.0 / float(v)
+                        n_contrib += 1
+                if n_contrib == 0 or inv_var_sum <= 0 or not np.isfinite(inv_var_sum):
+                    var[i] = np.nan
+                    continue
+                counts["__ncontrib__"] = counts.get("__ncontrib__", 0) + n_contrib
+                var[i] = 1.0 / inv_var_sum
         mask = np.isfinite(var)
         return ell_sorted[mask], var[mask], counts
 
@@ -1146,41 +1192,70 @@ def fisher_from_ell_by_ell_effective_experiment(
         counts = {k: 0 for k in sources.keys()}
         var = np.zeros_like(ell_sorted, dtype=float)
         for i, l in enumerate(ell_sorted):
-            best_src = None
-            best_proxy = None
-            best_dell = None
-            best_fsky = None
-            best_ntt = None
-            best_nee = None
-            for name, src in sources.items():
-                if not has_te.get(name, False):
-                    continue
-                ntt_map, dell_tt, fsky_tt = src["TT"]
-                nee_map, dell_ee, fsky_ee = src["EE"]
-                if (l not in ntt_map) or (l not in nee_map):
-                    continue
-                ntt = float(ntt_map[l])
-                nee = float(nee_map[l])
-                proxy = float(np.sqrt(max(0.0, ntt) * max(0.0, nee)))
-                if (best_proxy is None) or (proxy < best_proxy):
-                    best_proxy = proxy
-                    best_src = name
-                    best_ntt = ntt
-                    best_nee = nee
-                    best_dell = int(min(int(dell_tt.get(l, 1)), int(dell_ee.get(l, 1))))
-                    best_fsky = float(min(float(fsky_tt.get(l, 1.0)), float(fsky_ee.get(l, 1.0))))
-            if best_src is None:
-                var[i] = np.nan
-                continue
-            counts[best_src] += 1
             c_te = float(np.asarray(cls_cov["TE"])[int(l)])
             c_tt = float(np.asarray(cls_cov["TT"])[int(l)])
             c_ee = float(np.asarray(cls_cov["EE"])[int(l)])
-            var[i] = (
-                1.0
-                / ((2.0 * float(l) + 1.0) * float(best_fsky) * float(best_dell))
-                * (c_te**2 + (c_tt + float(best_ntt)) * (c_ee + float(best_nee)))
-            )
+
+            if str(ell_by_ell_policy) == "min_noise":
+                best_src = None
+                best_proxy = None
+                best_dell = None
+                best_fsky = None
+                best_ntt = None
+                best_nee = None
+                for name, src in sources.items():
+                    if not has_te.get(name, False):
+                        continue
+                    ntt_map, dell_tt, fsky_tt = src["TT"]
+                    nee_map, dell_ee, fsky_ee = src["EE"]
+                    if (l not in ntt_map) or (l not in nee_map):
+                        continue
+                    ntt = float(ntt_map[l])
+                    nee = float(nee_map[l])
+                    proxy = float(np.sqrt(max(0.0, ntt) * max(0.0, nee)))
+                    if (best_proxy is None) or (proxy < best_proxy):
+                        best_proxy = proxy
+                        best_src = name
+                        best_ntt = ntt
+                        best_nee = nee
+                        best_dell = int(min(int(dell_tt.get(l, 1)), int(dell_ee.get(l, 1))))
+                        best_fsky = float(min(float(fsky_tt.get(l, 1.0)), float(fsky_ee.get(l, 1.0))))
+                if best_src is None:
+                    var[i] = np.nan
+                    continue
+                counts[best_src] += 1
+                var[i] = (
+                    1.0
+                    / ((2.0 * float(l) + 1.0) * float(best_fsky) * float(best_dell))
+                    * (c_te**2 + (c_tt + float(best_ntt)) * (c_ee + float(best_nee)))
+                )
+            else:
+                inv_var_sum = 0.0
+                n_contrib = 0
+                for name, src in sources.items():
+                    if not has_te.get(name, False):
+                        continue
+                    ntt_map, dell_tt, fsky_tt = src["TT"]
+                    nee_map, dell_ee, fsky_ee = src["EE"]
+                    if (l not in ntt_map) or (l not in nee_map):
+                        continue
+                    ntt = float(ntt_map[l])
+                    nee = float(nee_map[l])
+                    dell = float(min(float(dell_tt.get(l, 1)), float(dell_ee.get(l, 1))))
+                    fsky = float(min(float(fsky_tt.get(l, 1.0)), float(fsky_ee.get(l, 1.0))))
+                    v = (
+                        1.0
+                        / ((2.0 * float(l) + 1.0) * fsky * dell)
+                        * (c_te**2 + (c_tt + ntt) * (c_ee + nee))
+                    )
+                    if np.isfinite(v) and v > 0:
+                        inv_var_sum += 1.0 / float(v)
+                        n_contrib += 1
+                if n_contrib == 0 or inv_var_sum <= 0 or not np.isfinite(inv_var_sum):
+                    var[i] = np.nan
+                    continue
+                counts["__ncontrib__"] = counts.get("__ncontrib__", 0) + n_contrib
+                var[i] = 1.0 / inv_var_sum
         mask = np.isfinite(var)
         return ell_sorted[mask], var[mask], counts
 
@@ -2144,7 +2219,8 @@ def compute_so_fisher_all(
                 full_lik_data = likelihood_multi.build_full_lik_data(req_spec, setup, full_noise_dict, cmb_theo)
                 full_lik_cov = likelihood_multi.build_full_lik_cov(full_lik_data, setup, full_noise_dict)
 
-                so_bands = fisher_multi.parse_spectrum_bands(full_lik_cov, ["SAT", "LAT", "LAT_pol"])
+                # Include LAT_cross so TE bands are generated for SO as well.
+                so_bands = fisher_multi.parse_spectrum_bands(full_lik_cov, ["SAT", "LAT", "LAT_pol", "LAT_cross"])
                 fisher_so = fisher_multi.fisher_forecast(
                     theta0={**theta0_run, **corr_dict_run},
                     param_list=param_list,
