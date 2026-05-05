@@ -331,6 +331,7 @@ def make_run_tag(
     planck_likelihood_mode: str = "pliklite_lowT",
     planck_tau_prior_sigma: float = 0.007,
     ell_by_ell_policy: str = "min_noise",
+    ell_by_ell_common_dell: int | None = None,
     use_standard_lcdm_amplitude: bool = False,
     use_ns: bool = False,
     param_list: Sequence[str] | None = None,
@@ -361,6 +362,9 @@ def make_run_tag(
         suffix.append("noisosignal")
     if mode == "ell_by_ell" and ell_by_ell_policy and ell_by_ell_policy != "min_noise":
         suffix.append(f"policy-{ell_by_ell_policy}")
+        if str(ell_by_ell_policy) == "min_diag_cov_common_bins":
+            dd = int(ell_by_ell_common_dell) if ell_by_ell_common_dell is not None else 20
+            suffix.append(f"cb{dd}")
     if planck_likelihood_mode == "TTTEEE_lowE":
         suffix.append(f"plancklowE-tauprior{_tag_float(planck_tau_prior_sigma, ndp=3)}")
     elif planck_likelihood_mode != "pliklite_lowT":
@@ -1010,6 +1014,12 @@ def fisher_from_ell_by_ell_effective_experiment(
     scaled10_params: set[str],
     use_iso_signal_in_cov: bool = True,
     ell_by_ell_policy: str = "min_noise",
+    ell_by_ell_common_bins: Sequence[tuple[int, int]] | None = None,
+    ell_by_ell_common_dell: int = 20,
+    ell_by_ell_score: str = "sigma_over_sqrt_dell",
+    ell_by_ell_hysteresis: float = 1.05,
+    ell_by_ell_min_segment_len: int = 2,
+    ell_by_ell_score_smooth_window: int = 3,
     verbose: bool = False,
 ):
     """
@@ -1022,6 +1032,7 @@ def fisher_from_ell_by_ell_effective_experiment(
     ell_by_ell_policy:
       - "min_noise": select a single experiment at each ell (can look piecewise at transitions)
       - "inv_var": inverse-variance combine experiments at each ell (smoother across overlaps)
+      - "min_diag_cov_common_bins": rebin all experiments onto a common binning, then choose one owner per common bin
 
     Experiment/f_sky conventions (per requirement):
       - Planck:   0.7
@@ -1031,9 +1042,10 @@ def fisher_from_ell_by_ell_effective_experiment(
     """
     import numpy as np
 
-    if str(ell_by_ell_policy) not in {"min_noise", "inv_var"}:
+    if str(ell_by_ell_policy) not in {"min_noise", "inv_var", "min_diag_cov_common_bins"}:
         raise ValueError(
-            f"Unsupported ELL_BY_ELL_POLICY={ell_by_ell_policy!r} (expected 'min_noise' or 'inv_var')."
+            f"Unsupported ELL_BY_ELL_POLICY={ell_by_ell_policy!r} "
+            "(expected 'min_noise', 'inv_var', or 'min_diag_cov_common_bins')."
         )
 
     from cosmocast_makelik.multi_freq_liq import fisher_multi
@@ -1073,6 +1085,351 @@ def fisher_from_ell_by_ell_effective_experiment(
     so_sat = [b for b in so_bands if str(getattr(b, "exp_key", "")) == "SAT"]
     so_lat_tt = [b for b in so_bands if str(getattr(b, "exp_key", "")) == "LAT"]
     so_lat_ee = [b for b in so_bands if str(getattr(b, "exp_key", "")) == "LAT_pol"]
+
+    def _rolling_median(x: np.ndarray, *, window: int) -> np.ndarray:
+        w = int(window)
+        if w <= 1 or len(x) == 0:
+            return np.asarray(x, dtype=float)
+        w = min(w, len(x))
+        half = w // 2
+        out = np.full_like(np.asarray(x, dtype=float), np.nan, dtype=float)
+        for i in range(len(out)):
+            lo = max(0, i - half)
+            hi = min(len(out), i + half + 1)
+            seg = np.asarray(x[lo:hi], dtype=float)
+            seg = seg[np.isfinite(seg)]
+            if len(seg) == 0:
+                continue
+            out[i] = float(np.median(seg))
+        return out
+
+    def _fix_short_segments(owners: list[str], *, min_len: int) -> list[str]:
+        n = len(owners)
+        if n == 0 or int(min_len) <= 1:
+            return owners
+        out = list(owners)
+        i = 0
+        while i < n:
+            j = i + 1
+            while j < n and out[j] == out[i]:
+                j += 1
+            seg_len = j - i
+            if seg_len < int(min_len):
+                left = out[i - 1] if i - 1 >= 0 else None
+                right = out[j] if j < n else None
+                repl = left if left is not None else right
+                if repl is None:
+                    i = j
+                    continue
+                for k in range(i, j):
+                    out[k] = repl
+            i = j
+        return out
+
+    def _select_owners_with_hysteresis(
+        *,
+        scores_by_exp: dict[str, np.ndarray],
+        exp_names: list[str],
+        hysteresis: float,
+        min_segment_len: int,
+    ) -> list[str]:
+        nbin = len(next(iter(scores_by_exp.values()))) if scores_by_exp else 0
+        if nbin == 0:
+            return []
+
+        # Per bin: best experiment by score.
+        best_by_bin: list[str] = []
+        for i in range(nbin):
+            best = None
+            best_score = None
+            for name in exp_names:
+                s = float(scores_by_exp[name][i])
+                if not np.isfinite(s):
+                    continue
+                if best_score is None or s < best_score:
+                    best_score = s
+                    best = name
+            best_by_bin.append(best or "")
+
+        owners: list[str] = []
+        current = ""
+        for i in range(nbin):
+            best = best_by_bin[i]
+            if current == "":
+                current = best
+                owners.append(current)
+                continue
+            if best == "" or best == current:
+                owners.append(current)
+                continue
+            s_cur = float(scores_by_exp[current][i]) if current in scores_by_exp else float("nan")
+            s_new = float(scores_by_exp[best][i]) if best in scores_by_exp else float("nan")
+            if np.isfinite(s_cur) and np.isfinite(s_new) and s_new <= s_cur / float(hysteresis):
+                current = best
+            owners.append(current)
+
+        owners = _fix_short_segments(owners, min_len=int(min_segment_len))
+        return owners
+
+    def _band_entries_for_spec(
+        *,
+        bands: Sequence[Any],
+        cell_type: str,
+        fsky_override: float | None,
+    ) -> list[dict[str, float]]:
+        """
+        Extract per-band diagonal variances with inferred [ell_min, ell_max] support.
+        Returned entries are dicts with: ell_eff, ell_min, ell_max, var, dell, fsky.
+        """
+        out: list[dict[str, float]] = []
+        for b in bands:
+            if str(getattr(b, "cell_type", "")) != str(cell_type):
+                continue
+            ell_arr = np.asarray(getattr(b, "ell"), dtype=float)
+            var_arr = np.asarray(getattr(b, "cov"), dtype=float)
+            dell = int(getattr(b, "dell", 1))
+            fsky = float(getattr(b, "fsky", 1.0)) if fsky_override is None else float(fsky_override)
+            if len(ell_arr) != len(var_arr):
+                continue
+            half = int(dell) // 2
+            # Map to inclusive integer bounds with approximate width == dell.
+            for e, v in zip(ell_arr, var_arr):
+                if not np.isfinite(v) or float(v) <= 0:
+                    continue
+                cen = int(np.round(float(e)))
+                ell_min = int(cen - half)
+                ell_max = int(ell_min + int(dell) - 1)
+                if ell_max < 2:
+                    continue
+                ell_min = max(2, ell_min)
+                out.append(
+                    {
+                        "ell_eff": float(cen),
+                        "ell_min": float(ell_min),
+                        "ell_max": float(ell_max),
+                        "var": float(v),
+                        "dell": float(dell),
+                        "fsky": float(fsky),
+                    }
+                )
+        # Consolidate identical ranges by taking the minimum variance (avoid double counting channels).
+        merged: dict[tuple[int, int], dict[str, float]] = {}
+        for d in out:
+            k = (int(d["ell_min"]), int(d["ell_max"]))
+            if k not in merged or float(d["var"]) < float(merged[k]["var"]):
+                merged[k] = d
+        return list(merged.values())
+
+    def _build_common_bins_for_spec(
+        *, entries_by_exp: dict[str, list[dict[str, float]]], common_bins: Sequence[tuple[int, int]] | None, dell: int
+    ) -> list[tuple[int, int]]:
+        if common_bins is not None:
+            out = [(int(a), int(b)) for (a, b) in common_bins if int(b) >= int(a)]
+            return out
+        ell_min = None
+        ell_max = None
+        for ent in entries_by_exp.values():
+            for d in ent:
+                ell_min = int(d["ell_min"]) if ell_min is None else min(int(ell_min), int(d["ell_min"]))
+                ell_max = int(d["ell_max"]) if ell_max is None else max(int(ell_max), int(d["ell_max"]))
+        if ell_min is None or ell_max is None:
+            return []
+        ell_min = max(2, int(ell_min))
+        ell_max = int(ell_max)
+        dd = max(1, int(dell))
+        bins: list[tuple[int, int]] = []
+        l = ell_min
+        while l <= ell_max:
+            r = min(ell_max, l + dd - 1)
+            bins.append((int(l), int(r)))
+            l = r + 1
+        return bins
+
+    def _rebin_to_common_bins(
+        *,
+        entries: list[dict[str, float]],
+        common_bins: list[tuple[int, int]],
+        coverage_fraction_min: float = 0.8,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Map original diagonal variances onto common bins using overlap weighting.
+        Returns (ell_eff, var_common, coverage_frac) arrays aligned with common_bins.
+        """
+        ell_eff = np.array([(a + b) / 2.0 for (a, b) in common_bins], dtype=float)
+        var = np.full(len(common_bins), np.nan, dtype=float)
+        covfrac = np.zeros(len(common_bins), dtype=float)
+
+        if not entries or not common_bins:
+            return ell_eff, var, covfrac
+
+        # Precompute entry intervals.
+        e_int = []
+        for d in entries:
+            a = float(d["ell_min"])
+            b = float(d["ell_max"])
+            if b < a:
+                continue
+            e_int.append((a, b, float(d["var"]), float(d["fsky"]), float(d["dell"])))
+
+        for i, (cmin, cmax) in enumerate(common_bins):
+            cmin = float(cmin)
+            cmax = float(cmax)
+            clen = float(cmax - cmin + 1.0)
+            if clen <= 0:
+                continue
+            total_overlap = 0.0
+            vv = 0.0
+            for (a, b, v, _fsky, _dell) in e_int:
+                ov = max(0.0, min(b, cmax) - max(a, cmin) + 1.0)
+                if ov <= 0:
+                    continue
+                w = float(ov / clen)
+                total_overlap += ov
+                vv += (w * w) * float(v)
+            covfrac[i] = float(total_overlap / clen) if clen > 0 else 0.0
+            if covfrac[i] >= float(coverage_fraction_min) and vv > 0 and np.isfinite(vv):
+                var[i] = float(vv)
+        return ell_eff, var, covfrac
+
+    def _cov_matrix_from_bands(
+        *,
+        bands: Sequence[Any],
+        cell_type: str,
+        fsky_override: float | None,
+    ) -> tuple[np.ndarray, np.ndarray, int, float, bool]:
+        """
+        Extract an experiment covariance for (cell_type) from SpectrumBand-like objects.
+
+        Returns (ell_centers, cov, dell, fsky, is_diagonal). If no full covariance is
+        present, returns a diagonal covariance matrix built from the best available
+        diagonal variances across channels.
+        """
+        import numpy as np
+
+        # Prefer a single band with a full covariance matrix, if present.
+        full_candidates = []
+        diag_candidates = []
+        for b in bands:
+            if str(getattr(b, "cell_type", "")) != str(cell_type):
+                continue
+            ell = np.asarray(getattr(b, "ell"), dtype=float)
+            cov = np.asarray(getattr(b, "cov"), dtype=float)
+            dell = int(getattr(b, "dell", 1))
+            fsky = float(getattr(b, "fsky", 1.0)) if fsky_override is None else float(fsky_override)
+            if cov.ndim == 2 and cov.shape[0] == cov.shape[1] and cov.shape[0] == len(ell):
+                full_candidates.append((ell, cov, dell, fsky))
+            elif cov.ndim == 1 and len(cov) == len(ell):
+                diag_candidates.append((ell, cov, dell, fsky))
+
+        if full_candidates:
+            # Choose the largest matrix (most bins).
+            ell, cov, dell, fsky = sorted(full_candidates, key=lambda t: int(len(t[0])), reverse=True)[0]
+            return np.asarray(ell, dtype=float), np.asarray(cov, dtype=float), int(dell), float(fsky), False
+
+        if not diag_candidates:
+            return np.array([], dtype=float), np.zeros((0, 0), dtype=float), 1, float(fsky_override or 1.0), True
+
+        # Conservative across channels: keep minimum variance per ell center.
+        # (Assumes channels are measuring the same estimator with shared signal; we avoid inv-var combining here.)
+        base_ell = None
+        best_var: dict[int, float] = {}
+        best_dell: dict[int, int] = {}
+        best_fsky: dict[int, float] = {}
+        for ell, var, dell, fsky in diag_candidates:
+            if base_ell is None:
+                base_ell = np.asarray(ell, dtype=float)
+            for e, v in zip(np.asarray(ell, dtype=float), np.asarray(var, dtype=float)):
+                ee = int(np.round(float(e)))
+                vv = float(v)
+                if not np.isfinite(vv) or vv <= 0:
+                    continue
+                if (ee not in best_var) or (vv < best_var[ee]):
+                    best_var[ee] = vv
+                    best_dell[ee] = int(dell)
+                    best_fsky[ee] = float(fsky)
+
+        ells = np.array(sorted(best_var.keys()), dtype=float)
+        if len(ells) == 0:
+            return np.array([], dtype=float), np.zeros((0, 0), dtype=float), 1, float(fsky_override or 1.0), True
+        var_vec = np.array([best_var[int(e)] for e in ells], dtype=float)
+        cov = np.diag(var_vec)
+        # Metadata: keep conservative (min) across selected points.
+        dell_eff = int(min(best_dell[int(e)] for e in ells))
+        fsky_eff = float(min(best_fsky[int(e)] for e in ells))
+        return ells, cov, dell_eff, fsky_eff, True
+
+    def _rebin_cov_matrix_to_common_bins(
+        *,
+        ell_centers: np.ndarray,
+        cov: np.ndarray,
+        dell: int,
+        common_bins: list[tuple[int, int]],
+        coverage_fraction_min: float = 0.8,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Rebin a covariance matrix defined on original bins (ell_centers with scalar dell)
+        onto common bins using overlap weights.
+
+        Returns (ell_eff_common, cov_common, coverage_frac_common, W) where W is the
+        overlap weight matrix (n_common, n_orig).
+        """
+        import numpy as np
+
+        ell_centers = np.asarray(ell_centers, dtype=float)
+        cov = np.asarray(cov, dtype=float)
+        if len(ell_centers) == 0:
+            n = len(common_bins)
+            return (
+                np.array([(a + b) / 2.0 for (a, b) in common_bins], dtype=float),
+                np.zeros((n, n), dtype=float),
+                np.zeros(n, dtype=float),
+                np.zeros((n, 0), dtype=float),
+            )
+        if cov.ndim == 1:
+            cov = np.diag(np.asarray(cov, dtype=float))
+        if cov.shape[0] != cov.shape[1] or cov.shape[0] != len(ell_centers):
+            raise ValueError("cov must be square with size matching ell_centers")
+
+        # Original bin intervals inferred from scalar dell around center (same convention as elsewhere).
+        half = int(dell) // 2
+        orig_bins = []
+        for e in ell_centers:
+            cen = int(np.round(float(e)))
+            omin = max(2, int(cen - half))
+            omax = int(omin + int(dell) - 1)
+            orig_bins.append((float(omin), float(omax)))
+
+        ell_eff_common = np.array([(a + b) / 2.0 for (a, b) in common_bins], dtype=float)
+        n_common = len(common_bins)
+        n_orig = len(orig_bins)
+        W = np.zeros((n_common, n_orig), dtype=float)
+        covfrac = np.zeros(n_common, dtype=float)
+        for i, (cmin_i, cmax_i) in enumerate(common_bins):
+            cmin = float(cmin_i)
+            cmax = float(cmax_i)
+            clen = float(cmax - cmin + 1.0)
+            total_overlap = 0.0
+            if clen <= 0:
+                continue
+            for j, (omin, omax) in enumerate(orig_bins):
+                ov = max(0.0, min(omax, cmax) - max(omin, cmin) + 1.0)
+                if ov <= 0:
+                    continue
+                w = float(ov / clen)
+                W[i, j] = w
+                total_overlap += ov
+            covfrac[i] = float(total_overlap / clen) if clen > 0 else 0.0
+
+        cov_common = W @ cov @ W.T
+        # Mask bins that don't meet coverage.
+        ok = covfrac >= float(coverage_fraction_min)
+        # We keep the full matrix but will treat uncovered bins as NaN on the diagonal for scoring;
+        # and they will be excluded from the effective band list.
+        diag = np.diag(cov_common).astype(float)
+        diag[~ok] = np.nan
+        # Write back NaNs only on diagonal; keep off-diags as computed (they won't be used if bins excluded).
+        np.fill_diagonal(cov_common, diag)
+        return ell_eff_common, cov_common, covfrac, W
 
     # Build noise dictionaries for TT/EE per "effective experiment"
     n_tt_planck, dell_tt_planck, fsky_tt_planck = _noise_dict_from_bands_auto(
@@ -1259,9 +1616,198 @@ def fisher_from_ell_by_ell_effective_experiment(
         mask = np.isfinite(var)
         return ell_sorted[mask], var[mask], counts
 
-    ell_tt, cov_tt, counts_tt = _select_auto("TT")
-    ell_ee, cov_ee, counts_ee = _select_auto("EE")
-    ell_te, cov_te, counts_te = _select_te()
+    effective_covariance_is_diagonal_flag = False
+    if str(ell_by_ell_policy) != "min_diag_cov_common_bins":
+        ell_tt, cov_tt, counts_tt = _select_auto("TT")
+        ell_ee, cov_ee, counts_ee = _select_auto("EE")
+        ell_te, cov_te, counts_te = _select_te()
+
+        owner_bins = None
+        owner_map = None
+        common_bins_by_spec = None
+    else:
+        # Conservative, common-bin ownership selection based on diagonal covariances.
+        if str(ell_by_ell_score) != "sigma_over_sqrt_dell":
+            raise ValueError(
+                f"Unsupported ell_by_ell_score={ell_by_ell_score!r} (expected 'sigma_over_sqrt_dell')."
+            )
+
+        exp_names = ["Planck", "SO SAT", "SO LAT", "LiteBIRD"]
+        bands_by_exp_spec: dict[str, dict[str, tuple[Sequence[Any], float | None]]] = {
+            "Planck": {"TT": (planck_bands, 0.7), "TE": (planck_bands, 0.7), "EE": (planck_bands, 0.7)},
+            "LiteBIRD": {"TT": (litebird_bands, 0.7), "TE": (litebird_bands, 0.7), "EE": (litebird_bands, 0.7)},
+            "SO SAT": {"TT": (so_sat, 0.1), "TE": (so_sat, 0.1), "EE": (so_sat, 0.1)},
+            # For SO LAT, use LAT bands for TT/TE and LAT_pol for EE.
+            "SO LAT": {"TT": (so_lat_tt, 0.4), "TE": (so_lat_tt, 0.4), "EE": (so_lat_ee, 0.4)},
+        }
+
+        common_bins_by_spec = {}
+        owner_bins = {}
+        owner_map = {}
+        counts_tt = {k: 0 for k in exp_names}
+        counts_te = {k: 0 for k in exp_names}
+        counts_ee = {k: 0 for k in exp_names}
+
+        effective_covariance_is_diagonal = False
+
+        def _do_spec(spec: str) -> tuple[np.ndarray, np.ndarray, dict[str, int], dict[str, Any]]:
+            """
+            Returns (ell_eff_int, cov_diag_for_bands, counts, diag_meta).
+
+            Also stores full covariance selection details in diag_meta for later Fisher build.
+            """
+            entries_by_exp = {}
+            for name in exp_names:
+                bands_here, fsky_ovr = bands_by_exp_spec[name][spec]
+                entries_by_exp[name] = _band_entries_for_spec(
+                    bands=bands_here, cell_type=spec, fsky_override=float(fsky_ovr) if fsky_ovr is not None else None
+                )
+
+            common_bins = _build_common_bins_for_spec(
+                entries_by_exp=entries_by_exp, common_bins=ell_by_ell_common_bins, dell=int(ell_by_ell_common_dell)
+            )
+            common_bins_by_spec[spec] = common_bins
+            if not common_bins:
+                return np.array([], dtype=int), np.array([], dtype=float), {k: 0 for k in exp_names}, {}
+
+            dell_common = np.array([float(b - a + 1) for (a, b) in common_bins], dtype=float)
+
+            # Build rebinned covariance matrices per experiment (full if available).
+            cov_common_by_exp: dict[str, np.ndarray] = {}
+            score_by_exp: dict[str, np.ndarray] = {}
+            score_smooth_by_exp: dict[str, np.ndarray] = {}
+            ell_eff_common = np.array([(a + b) / 2.0 for (a, b) in common_bins], dtype=float)
+            diag_cov_available_by_exp: dict[str, bool] = {}
+            used_diagonal_by_exp: dict[str, bool] = {}
+
+            for name in exp_names:
+                bands_here, fsky_ovr = bands_by_exp_spec[name][spec]
+                ell0, cov0, dell0, fsky0, is_diag0 = _cov_matrix_from_bands(
+                    bands=bands_here, cell_type=spec, fsky_override=float(fsky_ovr) if fsky_ovr is not None else None
+                )
+                used_diagonal_by_exp[name] = bool(is_diag0)
+                diag_cov_available_by_exp[name] = (len(ell0) > 0)
+                if len(ell0) == 0:
+                    cov_common_by_exp[name] = np.full((len(common_bins), len(common_bins)), np.nan, dtype=float)
+                    score_by_exp[name] = np.full(len(common_bins), np.nan, dtype=float)
+                    continue
+                ell_eff_i, cov_common, covfrac_i, _W = _rebin_cov_matrix_to_common_bins(
+                    ell_centers=ell0,
+                    cov=cov0,
+                    dell=int(dell0),
+                    common_bins=common_bins,
+                    coverage_fraction_min=0.8,
+                )
+                ell_eff_common = ell_eff_i
+                cov_common_by_exp[name] = cov_common
+                var_diag = np.diag(cov_common).astype(float)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    score = np.sqrt(var_diag) / np.sqrt(dell_common)
+                score_by_exp[name] = score
+
+            # Smooth log(score) for ownership decisions only.
+            for name in exp_names:
+                s = np.asarray(score_by_exp[name], dtype=float)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    ls = np.log(s)
+                ls_s = _rolling_median(ls, window=int(ell_by_ell_score_smooth_window))
+                score_smooth_by_exp[name] = np.exp(ls_s)
+
+            owners = _select_owners_with_hysteresis(
+                scores_by_exp=score_smooth_by_exp,
+                exp_names=exp_names,
+                hysteresis=float(ell_by_ell_hysteresis),
+                min_segment_len=int(ell_by_ell_min_segment_len),
+            )
+            owner_map[spec] = owners
+
+            # Build effective covariance: preserve within-owner sub-blocks if available;
+            # cross-owner covariance set to 0 (conservative wrt unknown cross-owner correlations).
+            nbin = len(common_bins)
+            cov_eff = np.zeros((nbin, nbin), dtype=float)
+            counts = {k: 0 for k in exp_names}
+            bins_meta = []
+            for i, (bmin, bmax) in enumerate(common_bins):
+                owner = owners[i] if i < len(owners) else ""
+                # If owner missing for this bin, fall back to best available.
+                if owner == "" or not np.isfinite(float(score_smooth_by_exp.get(owner, np.array([np.nan]))[i])):
+                    best = None
+                    best_s = None
+                    for nm in exp_names:
+                        ss = float(score_smooth_by_exp[nm][i])
+                        if not np.isfinite(ss):
+                            continue
+                        if best_s is None or ss < best_s:
+                            best_s = ss
+                            best = nm
+                    owner = best or owner
+                if owner in counts:
+                    counts[owner] += 1
+                bins_meta.append(
+                    {
+                        "ell_min": int(bmin),
+                        "ell_max": int(bmax),
+                        "ell_eff": float(ell_eff_common[i]),
+                        "owner": str(owner),
+                        "score_by_exp": {k: float(score_by_exp[k][i]) for k in exp_names},
+                        "score_smooth_by_exp": {k: float(score_smooth_by_exp[k][i]) for k in exp_names},
+                        "owner_cov_is_diagonal": bool(used_diagonal_by_exp.get(owner, True)),
+                    }
+                )
+
+            # Fill cov_eff by owner blocks.
+            for i in range(nbin):
+                oi = owners[i] if i < len(owners) else ""
+                for j in range(nbin):
+                    oj = owners[j] if j < len(owners) else ""
+                    if oi == "" or oj == "" or oi != oj:
+                        continue
+                    cmat = cov_common_by_exp.get(oi)
+                    if cmat is None:
+                        continue
+                    val = float(cmat[i, j])
+                    if np.isfinite(val):
+                        cov_eff[i, j] = val
+
+            owner_bins[spec] = bins_meta
+
+            # Diagnostics band (diagonal only) for plotting/compat: use diag(cov_eff).
+            var_eff = np.diag(cov_eff).astype(float)
+            mask = np.isfinite(var_eff) & (var_eff > 0)
+            ell_out = np.asarray(ell_eff_common, dtype=float)[mask].astype(int)
+            cov_diag_out = np.asarray(var_eff[mask], dtype=float)
+
+            diag_meta = {
+                "common_bins": common_bins,
+                "ell_eff_common": np.asarray(ell_eff_common, dtype=float),
+                "owners": list(owners),
+                "cov_eff": cov_eff,
+                "mask": np.asarray(mask, dtype=bool),
+                "cov_common_by_exp": cov_common_by_exp,
+                "used_diagonal_by_exp": used_diagonal_by_exp,
+            }
+            return ell_out, cov_diag_out, counts, diag_meta
+
+        ell_tt, cov_tt, counts_tt, _meta_tt = _do_spec("TT")
+        ell_te, cov_te, counts_te, _meta_te = _do_spec("TE")
+        ell_ee, cov_ee, counts_ee, _meta_ee = _do_spec("EE")
+
+        # Determine whether any spec fell back to diagonal-only covariance for all owners.
+        # (We treat "diagonal-only" as used whenever at least one owner lacks full cov.)
+        effective_covariance_is_diagonal = False
+        for _m in [_meta_tt, _meta_te, _meta_ee]:
+            used_diag = (_m.get("used_diagonal_by_exp") or {}) if isinstance(_m, dict) else {}
+            if any(bool(v) for v in used_diag.values()):
+                effective_covariance_is_diagonal = True
+        effective_covariance_is_diagonal_flag = bool(effective_covariance_is_diagonal)
+        if verbose and effective_covariance_is_diagonal_flag:
+            print(
+                "[ell_by_ell:min_diag_cov_common_bins] WARNING: at least one selected owner covariance "
+                "was diagonal-only; Fisher uses diagonal fallback for those bins."
+            )
+
+        # Store for metadata / potential downstream diagnostics.
+        owner_bins["_cov_matrices"] = {"TT": _meta_tt, "TE": _meta_te, "EE": _meta_ee}
 
     bands_eff = [
         SpectrumBand(
@@ -1301,24 +1847,119 @@ def fisher_from_ell_by_ell_effective_experiment(
         def _cls_provider(*, lmax: int = ell_max_theory, **th):
             return _compute_cls_indexed(compute_cls, lmax=int(lmax), iso_mode=iso_mode, **th)
 
-    fisher = fisher_multi.fisher_forecast(
-        theta0=theta_fid,
-        param_list=list(param_list),
-        bands=bands_eff,
-        compute_cls=_cls_provider,
-        steps=steps,
-        scaled_params=scaled10_params,
-        ell_max=int(ell_max_theory),
-        use_pinv=True,
-    )
+    if str(ell_by_ell_policy) != "min_diag_cov_common_bins":
+        fisher = fisher_multi.fisher_forecast(
+            theta0=theta_fid,
+            param_list=list(param_list),
+            bands=bands_eff,
+            compute_cls=_cls_provider,
+            steps=steps,
+            scaled_params=scaled10_params,
+            ell_max=int(ell_max_theory),
+            use_pinv=True,
+        )
+    else:
+        # Full-covariance Fisher in common-bin space (per spectrum), using the
+        # selected-owner covariance sub-blocks whenever available.
+        import numpy as np
+
+        def _perturb(th0: dict[str, float], param: str, delta: float) -> dict[str, float]:
+            th = dict(th0)
+            if param in scaled10_params:
+                th[param] = (1e10 * th0[param] + delta) * 1e-10
+            else:
+                th[param] = th0[param] + delta
+            return th
+
+        # Prepare per-spectrum bin ell lists and covariance matrices (masked).
+        cov_meta = (owner_bins or {}).get("_cov_matrices", {}) if isinstance(owner_bins, dict) else {}
+        spec_info: dict[str, dict[str, Any]] = {}
+        for spec in ["TT", "TE", "EE"]:
+            m = cov_meta.get(spec, {}) or {}
+            ell_eff = np.asarray(m.get("ell_eff_common", []), dtype=float)
+            mask = np.asarray(m.get("mask", []), dtype=bool)
+            cov_eff = np.asarray(m.get("cov_eff", np.zeros((0, 0))), dtype=float)
+            if len(ell_eff) == 0 or cov_eff.size == 0 or len(mask) != len(ell_eff):
+                continue
+            ell_sel = np.asarray(ell_eff[mask], dtype=float).astype(int)
+            cov_sel = np.asarray(cov_eff[np.ix_(mask, mask)], dtype=float)
+            spec_info[spec] = {"ell": ell_sel, "cov": cov_sel}
+
+        npar = len(param_list)
+        F = np.zeros((npar, npar), dtype=float)
+
+        # Precompute all derivatives per spectrum.
+        D_by_spec: dict[str, np.ndarray] = {spec: np.zeros((npar, len(info["ell"])), dtype=float) for spec, info in spec_info.items()}
+        for ip, p in enumerate(param_list):
+            if p not in steps:
+                raise KeyError(f"No step size provided for parameter '{p}'")
+            step = float(steps[p])
+            th_hi = _perturb(theta_fid, p, +step)
+            th_lo = _perturb(theta_fid, p, -step)
+            cls_hi = _cls_provider(lmax=int(ell_max_theory), **th_hi)
+            cls_lo = _cls_provider(lmax=int(ell_max_theory), **th_lo)
+            for spec, info in spec_info.items():
+                ell_sel = info["ell"]
+                arr_hi = np.asarray(cls_hi[spec], dtype=float)
+                arr_lo = np.asarray(cls_lo[spec], dtype=float)
+                for k, e in enumerate(ell_sel):
+                    D_by_spec[spec][ip, k] = (float(arr_hi[int(e)]) - float(arr_lo[int(e)])) / (2.0 * step)
+
+        # Accumulate Fisher blocks per spectrum.
+        # Keep a local note; exported in metadata below.
+        # (True if we had to fall back to diagonal-only covariance anywhere.)
+        # effective_covariance_is_diagonal_flag is set earlier in this policy branch.
+        n_pinv = 0
+        conds: list[float] = []
+        for spec, info in spec_info.items():
+            cov = np.asarray(info["cov"], dtype=float)
+            if cov.shape[0] == 0:
+                continue
+            try:
+                cond = float(np.linalg.cond(cov))
+            except Exception:
+                cond = float("inf")
+            conds.append(cond)
+            try:
+                cov_inv = np.linalg.inv(cov)
+            except Exception:
+                cov_inv = np.linalg.pinv(cov)
+                n_pinv += 1
+            d = D_by_spec[spec]  # (npar, nbins)
+            F += d @ cov_inv @ d.T
+
+        F = 0.5 * (F + F.T)
+        Cov_params = np.linalg.pinv(F)
+        sigma = np.sqrt(np.diag(Cov_params))
+        fisher = fisher_multi.FisherResult(
+            F=F,
+            Cov_params=Cov_params,
+            sigma=sigma,
+            dC=[np.zeros(0, dtype=float) for _ in range(npar)],
+            bands=list(bands_eff),
+            param_list=list(param_list),
+        )
+        # Attach some solver diagnostics into metadata below.
+        if isinstance(getattr(fisher, "metadata", None), dict):
+            pass
     fisher.metadata = {
         "combination_mode": "ell_by_ell",
         "ell_by_ell_policy": ell_by_ell_policy,
+        "ell_by_ell_score": ell_by_ell_score,
+        "ell_by_ell_common_dell": int(ell_by_ell_common_dell),
+        "ell_by_ell_hysteresis": float(ell_by_ell_hysteresis),
+        "ell_by_ell_min_segment_len": int(ell_by_ell_min_segment_len),
+        "ell_by_ell_score_smooth_window": int(ell_by_ell_score_smooth_window),
         "use_iso_signal_in_cov": bool(use_iso_signal_in_cov),
         "iso_mode": iso_mode,
         "counts": {"TT": counts_tt, "TE": counts_te, "EE": counts_ee},
         "n_ell": {"TT": int(len(ell_tt)), "TE": int(len(ell_te)), "EE": int(len(ell_ee))},
     }
+    if str(ell_by_ell_policy) == "min_diag_cov_common_bins":
+        fisher.metadata["owner_map"] = owner_map or {}
+        fisher.metadata["owner_bins"] = owner_bins or {}
+        fisher.metadata["ell_by_ell_common_bins"] = common_bins_by_spec or {}
+        fisher.metadata["effective_covariance_is_diagonal"] = bool(effective_covariance_is_diagonal_flag)
 
     if verbose:
         print("[ell_by_ell] counts TT:", counts_tt)
@@ -1396,6 +2037,12 @@ def compare_and_save_constraints(
     compute_cls: Callable | None = None,
     f_sky_overlap: Any = None,
     ell_by_ell_policy: str = "min_noise",
+    ell_by_ell_common_bins: Sequence[tuple[int, int]] | None = None,
+    ell_by_ell_common_dell: int = 20,
+    ell_by_ell_score: str = "sigma_over_sqrt_dell",
+    ell_by_ell_hysteresis: float = 1.05,
+    ell_by_ell_min_segment_len: int = 2,
+    ell_by_ell_score_smooth_window: int = 3,
     planck_likelihood_mode: str = "pliklite_lowT",
     planck_tau_prior_sigma: float = 0.007,
     scaled10_params: set[str] | None = None,
@@ -1431,6 +2078,7 @@ def compare_and_save_constraints(
             planck_likelihood_mode=planck_likelihood_mode,
             planck_tau_prior_sigma=planck_tau_prior_sigma,
             ell_by_ell_policy=ell_by_ell_policy,
+            ell_by_ell_common_dell=int(ell_by_ell_common_dell),
             # This helper is used mainly for directory naming; if callers use the
             # standard ΛCDM option, they should pass an explicit out_year_tag or
             # compute a RUN_TAG that encodes it.
@@ -1532,6 +2180,12 @@ def compare_and_save_constraints(
                 scaled10_params=scaled10,
                 use_iso_signal_in_cov=bool(use_iso_signal_in_cov),
                 ell_by_ell_policy=str(ell_by_ell_policy),
+                ell_by_ell_common_bins=ell_by_ell_common_bins,
+                ell_by_ell_common_dell=int(ell_by_ell_common_dell),
+                ell_by_ell_score=str(ell_by_ell_score),
+                ell_by_ell_hysteresis=float(ell_by_ell_hysteresis),
+                ell_by_ell_min_segment_len=int(ell_by_ell_min_segment_len),
+                ell_by_ell_score_smooth_window=int(ell_by_ell_score_smooth_window),
                 verbose=False,
             )
             counts = (getattr(unified, "metadata", {}) or {}).get("counts", {})
@@ -1683,6 +2337,12 @@ def compare_and_save_constraints(
                     scaled10_params=scaled10,
                     use_iso_signal_in_cov=bool(use_iso_signal_in_cov),
                     ell_by_ell_policy=str(ell_by_ell_policy),
+                    ell_by_ell_common_bins=ell_by_ell_common_bins,
+                    ell_by_ell_common_dell=int(ell_by_ell_common_dell),
+                    ell_by_ell_score=str(ell_by_ell_score),
+                    ell_by_ell_hysteresis=float(ell_by_ell_hysteresis),
+                    ell_by_ell_min_segment_len=int(ell_by_ell_min_segment_len),
+                    ell_by_ell_score_smooth_window=int(ell_by_ell_score_smooth_window),
                     verbose=False,
                 )
                 pk_so_lb = unified
