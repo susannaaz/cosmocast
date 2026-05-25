@@ -1125,7 +1125,7 @@ def fisher_from_ell_by_ell_effective_experiment(
                     out[k] = repl
             i = j
         return out
-
+    
     def _select_owners_with_hysteresis(
         *,
         scores_by_exp: dict[str, np.ndarray],
@@ -1133,42 +1133,101 @@ def fisher_from_ell_by_ell_effective_experiment(
         hysteresis: float,
         min_segment_len: int,
     ) -> list[str]:
+        """
+        Select owner per common bin with hysteresis.
+
+        Important fix:
+        If the current owner has no finite score in a bin, immediately switch to the
+        best finite owner. Otherwise an experiment such as LiteBIRD can own low ell
+        and then incorrectly remain the owner at high ell where it has no coverage.
+        """
+        import numpy as np
+
         nbin = len(next(iter(scores_by_exp.values()))) if scores_by_exp else 0
         if nbin == 0:
             return []
 
-        # Per bin: best experiment by score.
+        # Best finite experiment per bin.
         best_by_bin: list[str] = []
         for i in range(nbin):
-            best = None
-            best_score = None
+            best = ""
+            best_score = np.inf
+
             for name in exp_names:
                 s = float(scores_by_exp[name][i])
                 if not np.isfinite(s):
                     continue
-                if best_score is None or s < best_score:
+
+                if s < best_score:
                     best_score = s
                     best = name
-            best_by_bin.append(best or "")
+
+            best_by_bin.append(best)
 
         owners: list[str] = []
         current = ""
+
         for i in range(nbin):
             best = best_by_bin[i]
+
+            # No experiment has coverage in this bin.
+            if best == "":
+                current = ""
+                owners.append("")
+                continue
+
+            # No current owner, so take the best available.
             if current == "":
                 current = best
                 owners.append(current)
                 continue
-            if best == "" or best == current:
+
+            # If current owner is not available in this bin, force switch.
+            if current not in scores_by_exp:
+                current = best
                 owners.append(current)
                 continue
-            s_cur = float(scores_by_exp[current][i]) if current in scores_by_exp else float("nan")
-            s_new = float(scores_by_exp[best][i]) if best in scores_by_exp else float("nan")
-            if np.isfinite(s_cur) and np.isfinite(s_new) and s_new <= s_cur / float(hysteresis):
+
+            s_cur = float(scores_by_exp[current][i])
+            s_best = float(scores_by_exp[best][i])
+
+            if not np.isfinite(s_cur):
                 current = best
+                owners.append(current)
+                continue
+
+            if not np.isfinite(s_best):
+                owners.append(current)
+                continue
+
+            # If the current owner is still the best, stay.
+            if best == current:
+                owners.append(current)
+                continue
+
+            # Hysteresis: switch only if the new best is sufficiently better.
+            if s_best <= s_cur / float(hysteresis):
+                current = best
+
             owners.append(current)
 
         owners = _fix_short_segments(owners, min_len=int(min_segment_len))
+
+        # Second safety pass: after short-segment fixing, do not allow an owner to
+        # remain assigned to a bin where that owner has no finite score.
+        for i, owner in enumerate(owners):
+            if owner == "":
+                continue
+
+            s_owner = float(scores_by_exp.get(owner, np.full(nbin, np.nan))[i])
+
+            if np.isfinite(s_owner):
+                continue
+
+            # Replace invalid owner with the best finite owner for this bin.
+            best = best_by_bin[i]
+            owners[i] = best
+
         return owners
 
     def _band_entries_for_spec(
